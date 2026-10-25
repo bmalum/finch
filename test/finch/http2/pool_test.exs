@@ -82,6 +82,92 @@ defmodule Finch.HTTP2.PoolTest do
       assert_receive {:resp, {:ok, {200, [], "hello to you"}}}
     end
 
+    test "a raising request body fails only that request", %{request: req} do
+      {:ok, pool} =
+        start_server_and_connect_with(fn port ->
+          start_pool(port)
+        end)
+
+      # A request from another caller that is in flight while the body raises.
+      bystander = Pool.async_request(pool, req, nil, [])
+      assert_recv_frames([headers(stream_id: bystander_stream_id)])
+
+      body =
+        {:stream,
+         Stream.map(1..2, fn
+           1 -> "data"
+           2 -> raise "disk read failed"
+         end)}
+
+      post = %{req | method: "POST", body: body}
+
+      assert {:error, %RuntimeError{message: "disk read failed"}, _acc} = request(pool, post, [])
+
+      assert_recv_frames([
+        headers(stream_id: stream_id),
+        rst_stream(stream_id: stream_id, error_code: :cancel)
+      ])
+
+      assert Process.alive?(pool)
+
+      # The other request is unaffected and completes normally.
+      hbf = server_encode_headers([{":status", "200"}])
+
+      server_send_frames([
+        headers(
+          stream_id: bystander_stream_id,
+          hbf: hbf,
+          flags: set_flags(:headers, [:end_headers, :end_stream])
+        )
+      ])
+
+      assert_receive {^bystander, {:status, 200}}
+      assert_receive {^bystander, {:headers, []}}
+      assert_receive {^bystander, :done}
+
+      assert {_, %{requests: requests, refs: refs}} = :sys.get_state(pool)
+      assert requests == %{}
+      assert refs == %{}
+    end
+
+    test "a request body that raises while streaming fails only that request",
+         %{request: req} do
+      {:ok, pool} =
+        start_server_and_connect_with([server_settings: [initial_window_size: 2]], fn port ->
+          start_pool(port)
+        end)
+
+      body =
+        {:stream,
+         Stream.map(1..2, fn
+           1 -> "data"
+           2 -> raise "disk read failed"
+         end)}
+
+      post = %{req | method: "POST", body: body}
+
+      # Make sure the pool has processed the whole SETTINGS exchange before the
+      # request starts, so that no other frame interleaves with the upload.
+      server_send_frames([ping(opaque_data: "settled!")])
+      ack_flags = set_flags(:ping, [:ack])
+      assert_recv_frames([ping(flags: ^ack_flags, opaque_data: "settled!")])
+
+      ref = Pool.async_request(pool, post, nil, [])
+
+      # The first chunk exceeds the window, so the enumerable is only resumed
+      # (and raises) once the server opens the window again.
+      assert_recv_frames([
+        headers(stream_id: stream_id),
+        data(stream_id: stream_id, data: "da")
+      ])
+
+      server_send_frames([window_update(stream_id: stream_id, window_size_increment: 100)])
+
+      assert_receive {^ref, {:error, %RuntimeError{message: "disk read failed"}}}
+      assert_recv_frames([rst_stream(stream_id: ^stream_id, error_code: :cancel)])
+      assert Process.alive?(pool)
+    end
+
     test "errors such as :max_header_list_size_reached are returned to the caller", %{
       request: req
     } do

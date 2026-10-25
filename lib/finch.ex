@@ -633,6 +633,9 @@ defmodule Finch do
     * `iodata` - the body to send for the request.
 
     * `{:stream, enumerable}` - stream request body chunks emitted by an `Enumerable`.
+      On HTTP/2 pools the enumerable is consumed inside the connection process that
+      is shared by all requests to that origin, so it should produce chunks cheaply
+      and must not block. If it raises, the request fails with `{:error, exception}`.
 
     * `{:stream, req_body_fun}` - stream request body chunks emitted by `req_body_fun`.
       Can only be used with `Finch.stream_while/5` on HTTP/1 pools.

@@ -34,5 +34,11 @@ defmodule Finch.ErrorTest do
       assert %Finch.Error{reason: :disconnected} = error
       assert Exception.message(error) == "connection is disconnected"
     end
+
+    test "returns other exceptions unchanged" do
+      source = %RuntimeError{message: "boom"}
+
+      assert Finch.Error.wrap(source) == source
+    end
   end
 end

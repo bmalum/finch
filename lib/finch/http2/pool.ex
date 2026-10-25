@@ -928,7 +928,7 @@ defmodule Finch.HTTP2.Pool do
   defp continue_request(data, ref, request) do
     with :streaming <- request.stream.status,
          window = smallest_window(data.conn, ref),
-         {stream, chunks} = RequestStream.next_chunk(request.stream, window),
+         {:ok, stream, chunks} <- next_chunk(request.stream, window),
          request = %{request | stream: stream},
          {:ok, data} <- stream_chunks(data, ref, chunks, request) do
       {:ok, complete_request_if_done(data, ref, request)}
@@ -940,7 +940,23 @@ defmodule Finch.HTTP2.Pool do
         {_from, data} = pop_request(data, ref)
 
         {:error, data, reason}
+
+      {:exception, exception} ->
+        # The request body enumerable raised. Reset this stream and fail only
+        # this request instead of taking the connection (and every other
+        # request multiplexed on it) down with it.
+        {:error, cancel_request(data, request.request_ref), exception}
     end
+  end
+
+  # The body enumerable is user code running inside the pool process, so any
+  # failure it produces is contained here.
+  defp next_chunk(stream, window) do
+    {stream, chunks} = RequestStream.next_chunk(stream, window)
+    {:ok, stream, chunks}
+  catch
+    :error, reason -> {:exception, Exception.normalize(:error, reason, __STACKTRACE__)}
+    kind, reason -> {:exception, Error.exception({kind, reason})}
   end
 
   defp complete_request_if_done(data, ref, %{stream: %{status: :done}} = request) do
