@@ -505,6 +505,62 @@ defmodule Finch.HTTP2.PoolTest do
       assert refs == %{}
     end
 
+    test "does not leak a monitor per request from the same caller", %{request: req} do
+      {:ok, pool} =
+        start_server_and_connect_with(fn port ->
+          start_pool(port)
+        end)
+
+      assert monitors_on_caller(pool) == 0
+
+      for _ <- 1..5 do
+        ref = Pool.async_request(pool, req, nil, [])
+
+        assert_recv_frames([headers(stream_id: stream_id)])
+        hbf = server_encode_headers([{":status", "200"}])
+
+        server_send_frames([
+          headers(
+            stream_id: stream_id,
+            hbf: hbf,
+            flags: set_flags(:headers, [:end_headers, :end_stream])
+          )
+        ])
+
+        assert_receive {^ref, {:status, 200}}
+        assert_receive {^ref, {:headers, []}}
+        assert_receive {^ref, :done}
+      end
+
+      assert {_, %{requests_by_pid: requests_by_pid}} = :sys.get_state(pool)
+      assert requests_by_pid == %{}
+      assert monitors_on_caller(pool) == 0
+    end
+
+    test "removes caller monitors when the connection is lost", %{request: req} do
+      {:ok, pool} =
+        start_server_and_connect_with(fn port ->
+          start_pool(port)
+        end)
+
+      assert monitors_on_caller(pool) == 0
+
+      ref = Pool.async_request(pool, req, nil, [])
+      assert_recv_frames([headers(stream_id: _stream_id)])
+      # Synchronize with the pool: the HEADERS frame is sent before the request
+      # is registered.
+      assert {_, %{requests_by_pid: requests_by_pid}} = :sys.get_state(pool)
+      assert map_size(requests_by_pid) == 1
+      assert monitors_on_caller(pool) == 1
+
+      :ok = :ssl.close(server_socket())
+      assert_receive {^ref, {:error, %Finch.Error{reason: :connection_closed}}}
+
+      assert {_, %{requests_by_pid: requests_by_pid}} = :sys.get_state(pool)
+      assert requests_by_pid == %{}
+      assert monitors_on_caller(pool) == 0
+    end
+
     test "cancel_async_request/1 returns :ok when the pool is disconnected", %{request: req} do
       {:ok, pool} =
         start_server_and_connect_with(fn port ->
@@ -992,6 +1048,11 @@ defmodule Finch.HTTP2.PoolTest do
   defp ready_waiter_count(pool) do
     {_state, data} = :sys.get_state(pool)
     length(data.awaiting_ready)
+  end
+
+  defp monitors_on_caller(pool) do
+    {:monitors, monitors} = Process.info(pool, :monitors)
+    Enum.count(monitors, &(&1 == {:process, self()}))
   end
 
   defp eventually(fun, attempts \\ 100)
