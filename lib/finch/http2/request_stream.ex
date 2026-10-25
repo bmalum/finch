@@ -24,20 +24,24 @@ defmodule Finch.HTTP2.RequestStream do
   defp with_byte_size(binary) when is_binary(binary), do: {binary, byte_size(binary)}
   defp with_byte_size(io_data), do: io_data |> IO.iodata_to_binary() |> with_byte_size()
 
-  defp reduce_with_suspend(
-         {message, message_size},
-         {message_buffer, message_buffer_size, window}
-       )
-       when message_size + message_buffer_size > window do
-    {:suspend,
-     {[{message, message_size} | message_buffer], message_size + message_buffer_size, window}}
-  end
-
+  # The accumulator always holds `{message, size}` pairs, regardless of whether we
+  # continue or suspend. Some enumerables (e.g. `Stream.take/2` on its final
+  # element) swallow the `:suspend` returned by the reducer and halt with the
+  # accumulator instead, so the `:done`/`:halted` branch below must be able to
+  # read the same shape.
   defp reduce_with_suspend(
          {message, message_size},
          {message_buffer, message_buffer_size, window}
        ) do
-    {:cont, {[message | message_buffer], message_size + message_buffer_size, window}}
+    message_buffer = [{message, message_size} | message_buffer]
+    message_buffer_size = message_size + message_buffer_size
+    acc = {message_buffer, message_buffer_size, window}
+
+    if message_buffer_size > window do
+      {:suspend, acc}
+    else
+      {:cont, acc}
+    end
   end
 
   # gets the next chunk of data that will fit into the given window size
@@ -58,14 +62,27 @@ defmodule Finch.HTTP2.RequestStream do
       _ ->
         # when the buffer can fit in the windows, continue reducing using the buffer
         # as the accumulator
-        continue_reduce(request, {[buffer], byte_size(buffer), window})
+        continue_reduce(request, {[with_byte_size(buffer)], byte_size(buffer), window})
     end
   end
 
   defp continue_reduce(request, acc) do
     case request.continuation.({:cont, acc}) do
-      {finished, {messages, _size, _window}} when finished in [:done, :halted] ->
-        {put_in(request.status, :done), Enum.reverse(messages)}
+      {finished, {messages, total_size, window_size}}
+      when finished in [:done, :halted] and total_size <= window_size ->
+        {put_in(request.status, :done), messages_to_chunks(messages)}
+
+      {finished, {messages, _total_size, window_size}} when finished in [:done, :halted] ->
+        # The enumerable finished but handed us more bytes than fit into the
+        # window (see `reduce_with_suspend/2`). Send what fits now and keep the
+        # rest buffered; there is nothing left to reduce, so the next call only
+        # has to drain the buffer.
+        <<fittable_binary::binary-size(^window_size), overload_binary::binary>> =
+          messages |> messages_to_chunks() |> IO.iodata_to_binary()
+
+        request = %{request | continuation: &finished_continuation/1, buffer: overload_binary}
+
+        {request, [fittable_binary]}
 
       {:suspended,
        {[{overload_message, overload_message_size} | messages_that_fit], total_size, window_size},
@@ -77,7 +94,13 @@ defmodule Finch.HTTP2.RequestStream do
 
         request = %{request | continuation: next_continuation, buffer: overload_binary}
 
-        {request, Enum.reverse([fittable_binary | messages_that_fit])}
+        {request, messages_to_chunks([{fittable_binary, fittable_size} | messages_that_fit])}
     end
   end
+
+  defp messages_to_chunks(messages) do
+    messages |> Enum.reverse() |> Enum.map(fn {message, _size} -> message end)
+  end
+
+  defp finished_continuation({:cont, acc}), do: {:done, acc}
 end

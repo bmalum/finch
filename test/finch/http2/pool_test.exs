@@ -82,6 +82,59 @@ defmodule Finch.HTTP2.PoolTest do
       assert_receive {:resp, {:ok, {200, [], "hello to you"}}}
     end
 
+    test "streams a Stream.take body whose last element exceeds the flow-control window",
+         %{request: req} do
+      us = self()
+
+      {:ok, pool} =
+        start_server_and_connect_with([server_settings: [initial_window_size: 100]], fn port ->
+          start_pool(port)
+        end)
+
+      # Stream.take/2 halts with the overflowing element instead of suspending,
+      # which used to crash the pool process.
+      body = {:stream, Stream.repeatedly(fn -> String.duplicate("x", 60) end) |> Stream.take(2)}
+      req = %{req | method: "POST", body: body}
+
+      # Make sure the pool has processed the whole SETTINGS exchange before the
+      # request starts, so that no other frame interleaves with the upload.
+      server_send_frames([ping(opaque_data: "settled!")])
+      ack_flags = set_flags(:ping, [:ack])
+      assert_recv_frames([ping(flags: ^ack_flags, opaque_data: "settled!")])
+
+      spawn(fn ->
+        result = request(pool, req, [])
+        send(us, {:resp, result})
+      end)
+
+      first_chunk = String.duplicate("x", 100)
+
+      assert_recv_frames([
+        headers(stream_id: stream_id),
+        data(stream_id: stream_id, data: ^first_chunk)
+      ])
+
+      server_send_frames([window_update(stream_id: stream_id, window_size_increment: 100)])
+
+      second_chunk = String.duplicate("x", 20)
+      end_stream = set_flags(:data, [:end_stream])
+
+      assert_recv_frames([
+        data(stream_id: ^stream_id, data: ^second_chunk),
+        data(stream_id: ^stream_id, data: "", flags: ^end_stream)
+      ])
+
+      hbf = server_encode_headers([{":status", "200"}])
+
+      server_send_frames([
+        headers(stream_id: stream_id, hbf: hbf, flags: set_flags(:headers, [:end_headers])),
+        data(stream_id: stream_id, data: "ok", flags: set_flags(:data, [:end_stream]))
+      ])
+
+      assert_receive {:resp, {:ok, {200, [], "ok"}}}
+      assert Process.alive?(pool)
+    end
+
     test "errors such as :max_header_list_size_reached are returned to the caller", %{
       request: req
     } do
